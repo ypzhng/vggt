@@ -6,6 +6,13 @@ import json
 import random
 import logging
 import warnings
+import sys
+from pathlib import Path
+
+# Add the project root to sys.path
+project_root = Path(__file__).resolve().parents[1]
+sys.path.append(str(project_root))
+
 from vggt.models.vggt import VGGT
 from vggt.utils.rotation import mat_to_quat
 from vggt.utils.load_fn import load_and_preprocess_images
@@ -13,6 +20,7 @@ from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 from vggt.utils.geometry import closed_form_inverse_se3
 from ba import run_vggt_with_ba
 import argparse
+
 
 # Suppress DINO v2 logs
 logging.getLogger("dinov2").setLevel(logging.WARNING)
