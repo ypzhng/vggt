@@ -20,6 +20,7 @@ from vggt.utils.load_fn import load_and_preprocess_images
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 from vggt.utils.geometry import closed_form_inverse_se3
 from ba import run_vggt_with_ba
+from vggt.utils import rotation_utils
 import argparse
 
 
@@ -213,6 +214,11 @@ def setup_args():
     parser.add_argument('--co3d_anno_dir', type=str, required=True, help='Path to CO3D annotations')
     parser.add_argument('--seed', type=int, default=0, help='Random seed for reproducibility')
     parser.add_argument('--model_path', type=str, required=True, help='Path to the VGGT model checkpoint')
+    parser.add_argument('--rotate', action=argparse.BooleanOptionalAction, default=False, 
+                        help='''Rotate the moodel. This will include online rotation for down-projection and
+                        out-projection. Note that this does not apply rotation to the K/Q and they will be rotated
+                        if we want to quantize the Keys''')
+    parser.add_argument('--rotate_mode', type=str, default='hadamard', choices=['hadamard', 'random'])
     return parser.parse_args()
 
 
@@ -345,9 +351,15 @@ def main():
 
     # Load model
     model = load_model(device, model_path=args.model_path)
-    ipdb.set_trace()
+    # ipdb.set_trace()
     # Set random seeds
     set_random_seeds(args.seed)
+    
+    if args.rotate:
+        ipdb.set_trace()
+        rotation_utils.fuse_layer_norms(model)
+        rotation_utils.rotate_model(model, args)
+        # utils.cleanup_memory(verbos=True)
 
     # Categories to evaluate
     SEEN_CATEGORIES = [

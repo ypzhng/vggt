@@ -52,7 +52,7 @@ def process_poses(co3d_dir, category, output_dir, min_quality):
     print("Processing category:", category)
     frame_file = osp.join(category_dir, "frame_annotations.jgz")
     sequence_file = osp.join(category_dir, "sequence_annotations.jgz")
-    subset_lists_file = osp.join(category_dir, "set_lists/set_lists_manyview_test_0.json")
+    subset_lists_file = osp.join(category_dir, "set_lists/set_lists_manyview_dev_0.json")
 
     # bbox_file = osp.join(output_dir, f"{category}_bbox.jgz")
 
