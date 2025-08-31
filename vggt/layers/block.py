@@ -11,6 +11,7 @@ import logging
 import os
 from typing import Callable, List, Any, Tuple, Dict
 import warnings
+import ipdb
 
 import torch
 from torch import nn, Tensor
@@ -77,6 +78,15 @@ class Block(nn.Module):
     def forward(self, x: Tensor, pos=None) -> Tensor:
         def attn_residual_func(x: Tensor, pos=None) -> Tensor:
             return self.ls1(self.attn(self.norm1(x), pos=pos))
+        # def attn_residual_func(x: torch.Tensor, pos=None) -> torch.Tensor:
+        #     norm_rotate = self.norm1(x)
+        #     attn_rotate = self.attn(norm_rotate, pos=pos)
+        #     ls1_rotate = self.ls1(attn_rotate)
+        #     # torch.save(norm_rotate.detach().cpu(), "norm_original.pt")
+        #     torch.save(attn_rotate.detach().cpu(), "attn_rotate.pt")
+        #     # torch.save(ls1_rotate.detach().cpu(), "ls1_original.pt")
+        #     ipdb.set_trace()
+        #     return ls1_rotate
 
         def ffn_residual_func(x: Tensor) -> Tensor:
             return self.ls2(self.mlp(self.norm2(x)))

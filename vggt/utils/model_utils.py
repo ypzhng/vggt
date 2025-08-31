@@ -2,6 +2,7 @@ import os
 import typing
 import logging
 import torch
+import ipdb
 import transformers
 from . import utils
 # from typing import Callable, Any, Optional
@@ -65,11 +66,11 @@ def get_layers(model):
         agg = getattr(model, "aggregator", None)
         if agg is not None:
             # patch path
-            patch_vit = getattr(agg, "patch_embed", None)
-            if patch_vit is not None:
-                pe_blocks = getattr(patch_vit, "blocks", None)
-                if pe_blocks is not None:
-                    layers.extend(list(pe_blocks))  # NestedTensorBlock
+            # patch_vit = getattr(agg, "patch_embed", None)
+            # if patch_vit is not None:
+            #     pe_blocks = getattr(patch_vit, "blocks", None)
+            #     if pe_blocks is not None:
+            #         layers.extend(list(pe_blocks))  # NestedTensorBlock
 
             # frame blocks
             frame_blocks = getattr(agg, "frame_blocks", None)
@@ -82,11 +83,11 @@ def get_layers(model):
                 layers.extend(list(global_blocks))  # Block
 
         # camera_head.trunk is Sequential of Block(s)
-        camera_head = getattr(model, "camera_head", None)
-        if camera_head is not None:
-            trunk = getattr(camera_head, "trunk", None)
-            if trunk is not None:
-                layers.extend(list(trunk))  # Block
+        # camera_head = getattr(model, "camera_head", None)
+        # if camera_head is not None:
+        #     trunk = getattr(camera_head, "trunk", None)
+        #     if trunk is not None:
+        #         layers.extend(list(trunk))  # Block
 
         # Return only modules that look like transformer blocks (have attn and mlp)
         pruned = []
@@ -96,6 +97,62 @@ def get_layers(model):
         return pruned
 
     raise NotImplementedError
+
+def _unwrap(m):
+    return getattr(m, 'module', m)
+
+def get_model_sizes(model):
+    # Original path for HuggingFace-style models
+    if hasattr(model, "config"):
+        hidden_size = model.config.hidden_size
+        num_heads = model.config.num_attention_heads
+        intermediate_size = getattr(model.config, "intermediate_size", None)
+        return hidden_size, num_heads, intermediate_size
+
+    # Minimal VGGT support: read from Aggregator's blocks
+    agg = getattr(model, "aggregator", model)  # allow passing either VGGT or Aggregator
+    blocks = None
+    # Prefer frame_blocks, then global_blocks
+    if hasattr(agg, "frame_blocks") and len(agg.frame_blocks) > 0:
+        blocks = agg.frame_blocks
+    elif hasattr(agg, "global_blocks") and len(agg.global_blocks) > 0:
+        blocks = agg.global_blocks
+    else:
+        raise ValueError("Could not find frame_blocks/global_blocks on the model for VGGT.")
+
+    blk = blocks[0]
+
+    # hidden_size from attn.proj Linear in_features (unwrap ActQuantWrapper if present)
+    attn = getattr(blk, "attn", None)
+    proj = getattr(attn, "proj", None) if attn is not None else None
+    hidden_size = None
+    if proj is not None:
+        lin = _unwrap(proj)
+        if isinstance(lin, torch.nn.Linear):
+            hidden_size = lin.in_features
+
+    # Fallback via mlp.fc2 out_features
+    if hidden_size is None and hasattr(blk, "mlp") and hasattr(blk.mlp, "fc2"):
+        lin = _unwrap(blk.mlp.fc2)
+        if isinstance(lin, torch.nn.Linear):
+            hidden_size = lin.out_features
+
+    # num_heads: prefer block.num_heads, else attn.num_heads
+    num_heads = getattr(blk, "num_heads", None)
+    if num_heads is None and attn is not None:
+        num_heads = getattr(attn, "num_heads", None)
+
+    # intermediate_size from mlp.fc1 out_features
+    intermediate_size = None
+    if hasattr(blk, "mlp") and hasattr(blk.mlp, "fc1"):
+        fc1_lin = _unwrap(blk.mlp.fc1)
+        if isinstance(fc1_lin, torch.nn.Linear):
+            intermediate_size = fc1_lin.out_features
+
+    if hidden_size is None or num_heads is None:
+        raise ValueError("Could not determine hidden_size/num_heads from VGGT Aggregator blocks.")
+
+    return hidden_size, num_heads, intermediate_size
 
 
 def get_llama(model_name, hf_token):

@@ -6,7 +6,7 @@ import transformers
 import tqdm, math
 import ipdb
 # from vggt.utils import quant_utils
-from hadamard_utils import random_hadamard_matrix, apply_exact_had_to_linear, is_pow2
+from vggt.utils.hadamard_utils import random_hadamard_matrix, apply_exact_had_to_linear, is_pow2
 from fast_hadamard_transform import hadamard_transform
 
 # def fuse_ln_linear(layernorm: torch.nn.Module, linear_layers: typing.Iterable[torch.nn.Linear]) -> None:
@@ -209,7 +209,7 @@ def replace_post_fusion_norms_with_rmsn(model):
     elif model_utils.VGGT_MODEL is not None and isinstance(model, model_utils.VGGT_MODEL):
         # VGGT widely uses torch.nn.LayerNorm in blocks and heads.
         # Replace every LayerNorm with RMSN matched by normalized_shape.
-        ipdb.set_trace()
+        # ipdb.set_trace()
         # model_utils.replace_modules(
         #     model,
         #     torch.nn.LayerNorm,
@@ -438,7 +438,7 @@ def rotate_attention_output(layer, Q, model_type) -> None:
         W = layer.self_attn.o_proj
     elif model_type == model_utils.OPT_MODEL:
         W = layer.self_attn.out_proj
-    elif model_type == "VGGT":
+    elif model_type == model_utils.VGGT_MODEL:
         # In VGGT Block, the Attention module exposes the output projection as .proj
         attn = getattr(layer, "attn", None)
         if attn is None or not hasattr(attn, "proj"):
@@ -479,7 +479,7 @@ def rotate_mlp_input(layer, Q, model_type):
         mlp_inputs = [layer.mlp.up_proj, layer.mlp.gate_proj]
     elif model_type == model_utils.OPT_MODEL:
         mlp_inputs = [layer.fc1]
-    elif model_type == "VGGT":
+    elif model_type == model_utils.VGGT_MODEL:
         # In VGGT Block, the MLP uses fc1 as the input projection
         mlp_inputs = [layer.mlp.fc1]
     else:
@@ -492,21 +492,49 @@ def rotate_mlp_input(layer, Q, model_type):
         Q64 = Q.to(device=dev, dtype=torch.float64)
         W.weight.data = (W_ @ Q64).to(device=dev, dtype=dtype)
     
+# def rotate_mlp_output(layer, Q, model_type):
+#     # Rotate the MLP output weights and bias.
+#     if model_type == model_utils.LLAMA_MODEL:
+#         W = layer.mlp.down_proj
+#     elif model_type == model_utils.OPT_MODEL:
+#         W = layer.fc2
+#     else:
+#         raise ValueError(f'Unknown model type {model_type}')
+#     dtype = W.weight.data.dtype
+#     W_ = W.weight.data.to(device=utils.DEV, dtype=torch.float64)
+#     W.weight.data = torch.matmul(Q.T, W_).to(device="cpu", dtype=dtype)
+#     apply_exact_had_to_linear(W, had_dim=-1, output=False) #apply exact (inverse) hadamard on the weights of mlp output
+#     if W.bias is not None:
+#         b = W.bias.data.to(device=utils.DEV, dtype=torch.float64)
+#         W.bias.data = torch.matmul(Q.T, b).to(device="cpu", dtype=dtype)
+
 def rotate_mlp_output(layer, Q, model_type):
     # Rotate the MLP output weights and bias.
     if model_type == model_utils.LLAMA_MODEL:
         W = layer.mlp.down_proj
     elif model_type == model_utils.OPT_MODEL:
         W = layer.fc2
+    elif model_type == model_utils.VGGT_MODEL:
+        # In VGGT Block, the MLP output projection is fc2
+        W = layer.mlp.fc2
     else:
         raise ValueError(f'Unknown model type {model_type}')
+
     dtype = W.weight.data.dtype
-    W_ = W.weight.data.to(device=utils.DEV, dtype=torch.float64)
-    W.weight.data = torch.matmul(Q.T, W_).to(device="cpu", dtype=dtype)
-    apply_exact_had_to_linear(W, had_dim=-1, output=False) #apply exact (inverse) hadamard on the weights of mlp output
+    dev = W.weight.data.device
+
+    W_ = W.weight.data.to(device=dev, dtype=torch.float64)
+    Q64 = Q.to(device=dev, dtype=torch.float64)
+
+    # Left-multiply by Q^T
+    W.weight.data = (Q64.T @ W_).to(device=dev, dtype=dtype)
+
+    # Apply exact (inverse) Hadamard on the weights of MLP output (unchanged helper)
+    apply_exact_had_to_linear(W, had_dim=-1, output=False)
+
     if W.bias is not None:
-        b = W.bias.data.to(device=utils.DEV, dtype=torch.float64)
-        W.bias.data = torch.matmul(Q.T, b).to(device="cpu", dtype=dtype)
+        b = W.bias.data.to(device=dev, dtype=torch.float64)
+        W.bias.data = (Q64.T @ b).to(device=dev, dtype=dtype)
 
 def matmul_hadU_cuda_had(X, hadK, transpose=False):
     '''
@@ -546,35 +574,172 @@ def rotate_head(model, Q: torch.Tensor) -> None:
     W_ = W.weight.data.to(device=utils.DEV, dtype=torch.float64)
     W.weight.data = torch.matmul(W_, Q).to(device="cpu", dtype=dtype)
 
+# def rotate_ov_proj(layer, model_type, head_num, head_dim):
+#     v_proj = layer.self_attn.v_proj
+#     if model_type == model_utils.LLAMA_MODEL:
+#         o_proj = layer.self_attn.o_proj
+#     elif model_type == model_utils.OPT_MODEL:
+#         o_proj = layer.self_attn.out_proj
+#     else:
+#         raise ValueError(f'Unknown model type {model_type}')
+    
+#     apply_exact_had_to_linear(v_proj, had_dim=head_dim, output=True)
+#     apply_exact_had_to_linear(o_proj, had_dim=-1, output=False)
+
 def rotate_ov_proj(layer, model_type, head_num, head_dim):
-    v_proj = layer.self_attn.v_proj
+    # For LLaMA/OPT, v_proj is explicit. For VGGT, V is the last third of attn.qkv.
     if model_type == model_utils.LLAMA_MODEL:
+        v_proj = layer.self_attn.v_proj
         o_proj = layer.self_attn.o_proj
+        # Apply Hadamard as before
+        apply_exact_had_to_linear(v_proj, had_dim=head_dim, output=True)
+        apply_exact_had_to_linear(o_proj, had_dim=-1, output=False)
     elif model_type == model_utils.OPT_MODEL:
+        v_proj = layer.self_attn.v_proj
         o_proj = layer.self_attn.out_proj
+        apply_exact_had_to_linear(v_proj, had_dim=head_dim, output=True)
+        apply_exact_had_to_linear(o_proj, had_dim=-1, output=False)
+    elif model_type == model_utils.VGGT_MODEL:
+        # VGGT: v is packed in attn.qkv (Linear(out=3*hidden, in=hidden)), o_proj is attn.proj
+        attn = getattr(layer, "attn", None)
+        if attn is None or not hasattr(attn, "qkv") or not hasattr(attn, "proj"):
+            raise AttributeError("Expected layer.attn.qkv and layer.attn.proj for VGGT")
+        qkv = attn.qkv  # Linear
+        proj = attn.proj
+
+        # Extract V slice: weights shape [3*H, H], biases [3*H]
+        W = qkv.weight
+        B = qkv.bias
+        out_features, in_features = W.shape
+        if out_features % 3 != 0:
+            raise ValueError(f"qkv.out_features ({out_features}) not divisible by 3")
+        H = in_features
+        if out_features != 3 * H:
+            raise ValueError(f"Expected qkv.out_features == 3*in_features, got {out_features} vs 3*{H}")
+
+        v_start, v_end = 2 * H, 3 * H
+
+        # Create a temporary Linear that views the V slice so we can reuse apply_exact_had_to_linear
+        # Note: We must copy to a temporary module, transform, then write back.
+        import torch
+        tmp_v = torch.nn.Linear(in_features=H, out_features=H, bias=(B is not None))
+        # Initialize with V slice (preserve dtype/device)
+        dev = W.device
+        dtype = W.dtype
+        tmp_v.weight.data = W[v_start:v_end, :].to(device=dev, dtype=dtype).clone()
+        if B is not None:
+            tmp_v.bias.data = B[v_start:v_end].to(device=dev, dtype=dtype).clone()
+
+        # Apply Hadamard to V projection (output=True matches original intent on v_proj)
+        apply_exact_had_to_linear(tmp_v, had_dim=head_dim, output=True)
+
+        # Write back transformed V slice
+        W[v_start:v_end, :] = tmp_v.weight.data.to(device=dev, dtype=dtype)
+        if B is not None:
+            B[v_start:v_end] = tmp_v.bias.data.to(device=dev, dtype=dtype)
+
+        # Apply Hadamard to the output projection (proj) exactly like o_proj before
+        apply_exact_had_to_linear(proj, had_dim=-1, output=False)
     else:
         raise ValueError(f'Unknown model type {model_type}')
-    
-    apply_exact_had_to_linear(v_proj, had_dim=head_dim, output=True)
-    apply_exact_had_to_linear(o_proj, had_dim=-1, output=False)
-
 
 @torch.inference_mode()
 def rotate_model(model, args):
-    Q = get_orthogonal_matrix(model.config.hidden_size,
-                                                args.rotate_mode)
-    config = model.config
-    num_heads = config.num_attention_heads
-    model_dim = config.hidden_size
-    head_dim = model_dim // num_heads
+    # Q = get_orthogonal_matrix(model.config.hidden_size,
+    #                                             args.rotate_mode)
+    # config = model.config
+    # num_heads = config.num_attention_heads
+    # model_dim = config.hidden_size
+    # head_dim = model_dim // num_heads
 
 
-    model_type = model_utils.model_type_extractor(model)
-    # rotate_embeddings(model, Q)
-    # rotate_head(model, Q)
-    # utils.cleanup_memory()
-    layers = model_utils.get_transformer_layers(model, 
-                                                model_type=model_type)
+    # model_type = model_utils.model_type_extractor(model)
+    # # rotate_embeddings(model, Q)
+    # # rotate_head(model, Q)
+    # # utils.cleanup_memory()
+    # layers = model_utils.get_transformer_layers(model, 
+    #                                             model_type=model_type)
+    if hasattr(model, "config"):
+        hidden_size = model.config.hidden_size
+        num_heads = model.config.num_attention_heads
+    else:
+        # VGGT path (no model.config): infer from the module structure.
+        # Prefer using model_utils helpers if available.
+        # 1) Get layers first, so we can inspect a block.
+        model_type = model_utils.model_type_extractor(model)
+        layers = model_utils.get_transformer_layers(model, model_type=model_type)
+        if len(layers) == 0:
+            raise ValueError("No transformer layers found to infer sizes.")
+
+        block = layers[0]
+
+        # Infer hidden_size from a canonical Linear in the block (e.g., attn.proj or mlp.fc2).
+        hidden_size = None
+        num_heads = None
+
+        # Try attention.proj first
+        attn = getattr(block, "self_attn", None) or getattr(block, "attn", None)
+        if attn is not None:
+            proj = getattr(attn, "o_proj", None) or getattr(attn, "out_proj", None) or getattr(attn, "proj", None)
+            if proj is not None and isinstance(proj, torch.nn.Linear):
+                hidden_size = proj.in_features  # proj: [hidden_size, hidden_size] as Linear(out,in) in PyTorch weight
+            # Try to infer num_heads from qkv or q_proj
+            qkv = getattr(attn, "qkv", None)
+            q_proj = getattr(attn, "q_proj", None)
+            if qkv is not None and isinstance(qkv, torch.nn.Linear):
+                # qkv.out_features = 3 * hidden_size; typical head_dim = hidden_size // num_heads
+                out_f, in_f = qkv.out_features, qkv.in_features
+                # Prefer in_f as hidden size if not set by proj
+                if hidden_size is None:
+                    hidden_size = in_f
+                # If divisible, guess num_heads from common head_dim divisors.
+                # We can try to find num_heads from attn.num_heads attribute if present.
+                num_heads_attr = getattr(attn, "num_heads", None) or getattr(attn, "num_attention_heads", None)
+                if isinstance(num_heads_attr, int) and num_heads_attr > 0:
+                    num_heads = num_heads_attr
+            elif q_proj is not None and isinstance(q_proj, torch.nn.Linear):
+                # q_proj.out_features = hidden_size; commonly hidden_size, and head_dim divides it.
+                if hidden_size is None:
+                    hidden_size = q_proj.out_features
+                num_heads_attr = getattr(attn, "num_heads", None) or getattr(attn, "num_attention_heads", None)
+                if isinstance(num_heads_attr, int) and num_heads_attr > 0:
+                    num_heads = num_heads_attr
+
+        # If still missing hidden_size, fall back to MLP fc2
+        if hidden_size is None:
+            mlp = getattr(block, "mlp", None)
+            if mlp is not None:
+                fc2 = getattr(mlp, "down_proj", None) or getattr(mlp, "fc2", None)
+                if fc2 is not None and isinstance(fc2, torch.nn.Linear):
+                    hidden_size = fc2.out_features  # fc2: Linear(out=hidden, in=intermediate)
+
+        if hidden_size is None:
+            raise ValueError("Could not infer hidden_size for model without config.")
+
+        # Infer num_heads if still None by probing common attributes on model or block
+        if num_heads is None:
+            # Try model-level attributes
+            num_heads = getattr(model, "num_heads", None) or getattr(model, "num_attention_heads", None)
+        if num_heads is None:
+            # Heuristic: try to infer from attn.qkv if available using common head_dim set
+            if attn is not None:
+                qkv = getattr(attn, "qkv", None)
+                if qkv is not None and isinstance(qkv, torch.nn.Linear):
+                    # Choose num_heads as the largest power-of-two divisor up to 128 that divides hidden_size
+                    for nh in (128, 96, 64, 48, 32, 24, 16, 12, 8, 6, 4, 3, 2):
+                        if hidden_size % nh == 0:
+                            num_heads = nh
+                            break
+        if num_heads is None:
+            raise ValueError("Could not infer num_attention_heads for model without config.")
+
+        # Now continue with layers already fetched
+        model_dim = hidden_size
+        head_dim = model_dim // num_heads
+
+    # Build Q and run rotations
+    Q = get_orthogonal_matrix(model_dim, args.rotate_mode)
+    
     for idx, layer in enumerate(tqdm.tqdm(layers, unit="layer", desc="Rotating")):
         rotate_attention_inputs(layers[idx], Q, model_type)
         rotate_attention_output(layers[idx], Q, model_type)

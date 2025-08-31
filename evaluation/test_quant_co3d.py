@@ -21,6 +21,10 @@ from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 from vggt.utils.geometry import closed_form_inverse_se3
 from ba import run_vggt_with_ba
 from vggt.utils import rotation_utils
+from vggt.utils import utils
+from vggt.utils import quant_utils
+from vggt.utils import hadamard_utils
+from vggt.utils import model_utils
 import argparse
 
 
@@ -219,6 +223,8 @@ def setup_args():
                         out-projection. Note that this does not apply rotation to the K/Q and they will be rotated
                         if we want to quantize the Keys''')
     parser.add_argument('--rotate_mode', type=str, default='hadamard', choices=['hadamard', 'random'])
+    parser.add_argument('--fp32_had', action=argparse.BooleanOptionalAction, default=False,
+                        help='Apply Hadamard rotation in FP32 (default: False)')
     return parser.parse_args()
 
 
@@ -359,7 +365,29 @@ def main():
         ipdb.set_trace()
         rotation_utils.fuse_layer_norms(model)
         rotation_utils.rotate_model(model, args)
-        # utils.cleanup_memory(verbos=True)
+        utils.cleanup_memory(verbos=True)
+        ipdb.set_trace()
+        allow_names = quant_utils.build_aggregator_linear_allowlist(model)
+        quant_utils.add_actquant(model,allow_names=allow_names)
+        qlayers = quant_utils.find_qlayers(model,allow_names)
+        hidden_size, num_heads, intermediate_size = model_utils.get_model_sizes(model)
+        head_dim = hidden_size // num_heads
+        for name in qlayers:
+            if 'mlp' in name and 'fc2' in name:
+                had_K, K = hadamard_utils.get_hadK(intermediate_size)
+                qlayers[name].online_full_had = True
+                qlayers[name].had_K = had_K
+                qlayers[name].K = K
+                qlayers[name].fp32_had = args.fp32_had
+            if 'attn' in name and 'proj' in name:
+                had_K, K = hadamard_utils.get_hadK(num_heads)
+                qlayers[name].online_partial_had = True
+                qlayers[name].had_K = had_K
+                qlayers[name].K = K
+                qlayers[name].had_dim = head_dim
+                qlayers[name].fp32_had = args.fp32_had
+    else:
+        quant_utils.add_actquant(model)
 
     # Categories to evaluate
     SEEN_CATEGORIES = [
