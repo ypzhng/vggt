@@ -6,6 +6,7 @@
 
 import logging
 import torch
+import ipdb
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
@@ -68,6 +69,7 @@ class Aggregator(nn.Module):
         qk_norm=True,
         rope_freq=100,
         init_values=0.01,
+        act_rotate_Q: torch.Tensor | None = None,
     ):
         super().__init__()
 
@@ -139,6 +141,12 @@ class Aggregator(nn.Module):
             self.register_buffer(name, torch.FloatTensor(value).view(1, 1, 3, 1, 1), persistent=False)
 
         self.use_reentrant = False # hardcoded to False
+        
+        self.register_buffer(
+            "act_rotate_Q_t",
+            None if act_rotate_Q is None else act_rotate_Q.t().contiguous().to(dtype=torch.float64),
+            persistent=False,
+        )
 
     def __build_patch_embed__(
         self,
@@ -180,6 +188,35 @@ class Aggregator(nn.Module):
             # Disable gradient updates for mask token
             if hasattr(self.patch_embed, "mask_token"):
                 self.patch_embed.mask_token.requires_grad_(False)
+    
+    def set_act_rotation(self, Q: torch.Tensor | None):
+        if Q is None:
+            self.act_rotate_Q_t = None
+        else:
+            self.act_rotate_Q_t = Q.t().contiguous().to(dtype=torch.float64)
+
+    # NEW: apply Q on last dim
+    def _apply_act_rotation(self, x: torch.Tensor) -> torch.Tensor:
+        # ipdb.set_trace()
+        if self.act_rotate_Q_t is None:
+            return x
+        H = self.act_rotate_Q_t.shape[0]
+        if x.shape[-1] != H:
+            raise ValueError(f"Activation rotation: last dim mismatch, x{tuple(x.shape)} vs Q dim {H}")
+        flat = x.view(-1, H).to(self.act_rotate_Q_t.dtype)
+        y =  flat @ self.act_rotate_Q_t.t() 
+        return y.view(*x.shape).to(x.dtype)
+    
+    def _apply_act_rotation_inv(self, x: torch.Tensor) -> torch.Tensor:
+        # ipdb.set_trace()
+        if self.act_rotate_Q_t is None:
+            return x
+        H = self.act_rotate_Q_t.shape[0]
+        if x.shape[-1] != H:
+            raise ValueError(f"Activation rotation: last dim mismatch, x{tuple(x.shape)} vs Q dim {H}")
+        flat = x.view(-1, H).to(self.act_rotate_Q_t.dtype)
+        y =  flat @ self.act_rotate_Q_t 
+        return y.view(*x.shape).to(x.dtype)
 
     def forward(self, images: torch.Tensor) -> Tuple[List[torch.Tensor], int]:
         """
@@ -215,6 +252,8 @@ class Aggregator(nn.Module):
 
         # Concatenate special tokens with patch tokens
         tokens = torch.cat([camera_token, register_token, patch_tokens], dim=1)
+        # torch.save(tokens.detach().cpu(),"init_rotate.pt")
+        # ipdb.set_trace()
 
         pos = None
         if self.rope is not None:
@@ -229,6 +268,8 @@ class Aggregator(nn.Module):
 
         # update P because we added special tokens
         _, P, C = tokens.shape
+        
+        tokens = self._apply_act_rotation(tokens)
 
         frame_idx = 0
         global_idx = 0
@@ -237,9 +278,12 @@ class Aggregator(nn.Module):
         for _ in range(self.aa_block_num):
             for attn_type in self.aa_order:
                 if attn_type == "frame":
+                    # ipdb.set_trace()
                     tokens, frame_idx, frame_intermediates = self._process_frame_attention(
                         tokens, B, S, P, C, frame_idx, pos=pos
                     )
+                    # ipdb.set_trace()
+                    # torch.save(tokens.detach().cpu(),"frame_original.pt")
                 elif attn_type == "global":
                     tokens, global_idx, global_intermediates = self._process_global_attention(
                         tokens, B, S, P, C, global_idx, pos=pos
@@ -276,8 +320,14 @@ class Aggregator(nn.Module):
                 tokens = checkpoint(self.frame_blocks[frame_idx], tokens, pos, use_reentrant=self.use_reentrant)
             else:
                 tokens = self.frame_blocks[frame_idx](tokens, pos=pos)
+                # torch.save(tokens.detach().cpu(),"frame_rotate.pt")
+                # ipdb.set_trace()
+                
+            tokens_rotate = self._apply_act_rotation_inv(tokens)
+            # torch.save(tokens.detach().cpu(),"frame_original.pt")
+            # ipdb.set_trace()
             frame_idx += 1
-            intermediates.append(tokens.view(B, S, P, C))
+            intermediates.append(tokens_rotate.view(B, S, P, C))
 
         return tokens, frame_idx, intermediates
 
@@ -299,8 +349,9 @@ class Aggregator(nn.Module):
                 tokens = checkpoint(self.global_blocks[global_idx], tokens, pos, use_reentrant=self.use_reentrant)
             else:
                 tokens = self.global_blocks[global_idx](tokens, pos=pos)
+            tokens_rotate = self._apply_act_rotation_inv(tokens)
             global_idx += 1
-            intermediates.append(tokens.view(B, S, P, C))
+            intermediates.append(tokens_rotate.view(B, S, P, C))
 
         return tokens, global_idx, intermediates
 

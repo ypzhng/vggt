@@ -364,30 +364,30 @@ def main():
     if args.rotate:
         ipdb.set_trace()
         rotation_utils.fuse_layer_norms(model)
+        rotation_utils.fuse_layerscales(model)
         rotation_utils.rotate_model(model, args)
-        utils.cleanup_memory(verbos=True)
-        ipdb.set_trace()
-        allow_names = quant_utils.build_aggregator_linear_allowlist(model)
-        quant_utils.add_actquant(model,allow_names=allow_names)
-        qlayers = quant_utils.find_qlayers(model,allow_names)
-        hidden_size, num_heads, intermediate_size = model_utils.get_model_sizes(model)
-        head_dim = hidden_size // num_heads
-        for name in qlayers:
-            if 'mlp' in name and 'fc2' in name:
-                had_K, K = hadamard_utils.get_hadK(intermediate_size)
-                qlayers[name].online_full_had = True
-                qlayers[name].had_K = had_K
-                qlayers[name].K = K
-                qlayers[name].fp32_had = args.fp32_had
-            if 'attn' in name and 'proj' in name:
-                had_K, K = hadamard_utils.get_hadK(num_heads)
-                qlayers[name].online_partial_had = True
-                qlayers[name].had_K = had_K
-                qlayers[name].K = K
-                qlayers[name].had_dim = head_dim
-                qlayers[name].fp32_had = args.fp32_had
-    else:
-        quant_utils.add_actquant(model)
+        # utils.cleanup_memory(verbos=True)
+        # ipdb.set_trace()
+        # allow_names = quant_utils.build_aggregator_linear_allowlist(model)
+        # quant_utils.add_actquant(model,allow_names=allow_names)
+        # qlayers = quant_utils.find_qlayers(model,allow_names)
+        # hidden_size, num_heads, intermediate_size = model_utils.get_model_sizes(model)
+        # head_dim = hidden_size // num_heads
+        # for name in qlayers:
+        #     if 'mlp' in name and 'fc2' in name:
+        #         had_K, K = hadamard_utils.get_hadK(intermediate_size)
+        #         qlayers[name].online_full_had = False #for debug only, default setting is True
+        #         qlayers[name].had_K = had_K
+        #         qlayers[name].K = K
+        #         qlayers[name].fp32_had = args.fp32_had
+        #     if 'attn' in name and 'proj' in name:
+        #         had_K, K = hadamard_utils.get_hadK(num_heads)
+        #         qlayers[name].online_partial_had = False #for debug only, default setting is True
+        #         qlayers[name].had_K = had_K
+        #         qlayers[name].K = K
+        #         qlayers[name].had_dim = head_dim
+        #         qlayers[name].fp32_had = args.fp32_had
+    
 
     # Categories to evaluate
     SEEN_CATEGORIES = [

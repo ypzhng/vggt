@@ -77,19 +77,29 @@ class Block(nn.Module):
 
     def forward(self, x: Tensor, pos=None) -> Tensor:
         def attn_residual_func(x: Tensor, pos=None) -> Tensor:
+            # ipdb.set_trace()
             return self.ls1(self.attn(self.norm1(x), pos=pos))
         # def attn_residual_func(x: torch.Tensor, pos=None) -> torch.Tensor:
         #     norm_rotate = self.norm1(x)
         #     attn_rotate = self.attn(norm_rotate, pos=pos)
         #     ls1_rotate = self.ls1(attn_rotate)
         #     # torch.save(norm_rotate.detach().cpu(), "norm_original.pt")
-        #     torch.save(attn_rotate.detach().cpu(), "attn_rotate.pt")
+        #     # torch.save(attn_rotate.detach().cpu(), "attn_rotate.pt")
         #     # torch.save(ls1_rotate.detach().cpu(), "ls1_original.pt")
-        #     ipdb.set_trace()
+        #     # ipdb.set_trace()
         #     return ls1_rotate
 
-        def ffn_residual_func(x: Tensor) -> Tensor:
-            return self.ls2(self.mlp(self.norm2(x)))
+        # def ffn_residual_func(x: Tensor) -> Tensor:
+        #     return self.ls2(self.mlp(self.norm2(x)))
+        
+        def ffn_residual_func(x:Tensor) -> Tensor:
+            torch.save(x.detach().cpu(),"x.pt")
+            norm_rotate = self.norm2(x)
+            mlp_rotate = self.mlp(norm_rotate)
+            ls2_rotate = self.ls2(mlp_rotate)
+            # torch.save(mlp_rotate.detach().cpu(),"mlp_original.pt")
+            # ipdb.set_trace()
+            return ls2_rotate
 
         if self.training and self.sample_drop_ratio > 0.1:
             # the overhead is compensated only for a drop path rate larger than 0.1
@@ -104,7 +114,10 @@ class Block(nn.Module):
             x = x + self.drop_path1(ffn_residual_func(x))  # FIXME: drop_path2
         else:
             x = x + attn_residual_func(x, pos=pos)
+            # torch.save(x.detach().cpu(),"attn_rotate.pt")
             x = x + ffn_residual_func(x)
+            # torch.save(x.detach().cpu(),"mlp_rotate.pt")
+            # ipdb.set_trace()
         return x
 
 

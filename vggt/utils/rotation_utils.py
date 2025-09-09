@@ -1,6 +1,8 @@
 from vggt.utils import model_utils
 import torch
+import torch.nn as nn
 import typing
+from typing import Optional, Iterable, List
 from . import utils
 import transformers
 import tqdm, math
@@ -82,36 +84,80 @@ def bake_mean_into_linear(linear: torch.nn.Linear) -> None:
         linear.bias.data = b_ - b_.mean()
         linear.bias.data = linear.bias.data.to(linear_dtype)
 
-def is_vggt_core_block(module: torch.nn.Module) -> bool:
+# def is_vggt_core_block(module: torch.nn.Module) -> bool:
+#     """
+#     Heuristic: VGGT core transformer-like blocks expose:
+#       - attributes 'attn' and 'mlp'
+#       - attn has a Linear named 'qkv' (VGGT Attention(qkv, proj, ...))
+#     TrackHead AttnBlock uses nn.MultiheadAttention and has no 'qkv' Linear, so this returns False.
+#     """
+#     if not (hasattr(module, "attn") and hasattr(module, "mlp")):
+#         return False
+#     attn = getattr(module, "attn", None)
+#     if attn is None:
+#         return False
+#     qkv = getattr(attn, "qkv", None)
+#     return isinstance(qkv, torch.nn.Linear)
+
+
+# def vggt_fused_ln_should_replace(parent: torch.nn.Module, name: str, module: torch.nn.Module) -> bool:
+#     """
+#     Replace ONLY LayerNorms that:
+#       - Live on a VGGT core block (is_vggt_core_block(parent) is True), and
+#       - Are named 'norm1' or 'norm2'.
+
+#     This skips:
+#       - LayerNorms inside attention (e.g., q_norm, k_norm) because their parent is 'attn', not the block.
+#       - LayerNorms in TrackHead/AttnBlock time_blocks, since is_vggt_core_block(parent) will be False.
+#       - Any other LayerNorms we did not fuse into.
+#     """
+#     if not isinstance(module, torch.nn.LayerNorm):
+#         return False
+#     if not is_vggt_core_block(parent):
+#         return False
+#     return name in ("norm1", "norm2")
+
+def _is_in_aggregator_core_path(qualified_name: str) -> bool:
     """
-    Heuristic: VGGT core transformer-like blocks expose:
-      - attributes 'attn' and 'mlp'
-      - attn has a Linear named 'qkv' (VGGT Attention(qkv, proj, ...))
-    TrackHead AttnBlock uses nn.MultiheadAttention and has no 'qkv' Linear, so this returns False.
+    Returns True iff the module path is under:
+      - aggregator.frame_blocks.{i}.*
+      - aggregator.global_blocks.{i}.*
     """
-    if not (hasattr(module, "attn") and hasattr(module, "mlp")):
+    if not qualified_name.startswith("aggregator."):
         return False
-    attn = getattr(module, "attn", None)
+    return (".frame_blocks." in qualified_name) or (".global_blocks." in qualified_name)
+
+def is_vggt_core_block(parent_module: torch.nn.Module, parent_qualified_name: str) -> bool:
+    """
+    VGGT core transformer block check restricted to Aggregator's frame/global blocks.
+    Conditions:
+      - Path is under aggregator.(frame_blocks|global_blocks).*
+      - Module exposes attributes 'attn' and 'mlp'
+      - attn has a Linear named 'qkv'
+    """
+    if not _is_in_aggregator_core_path(parent_qualified_name):
+        return False
+    if not (hasattr(parent_module, "attn") and hasattr(parent_module, "mlp")):
+        return False
+    attn = getattr(parent_module, "attn", None)
     if attn is None:
         return False
     qkv = getattr(attn, "qkv", None)
     return isinstance(qkv, torch.nn.Linear)
 
-
-def vggt_fused_ln_should_replace(parent: torch.nn.Module, name: str, module: torch.nn.Module) -> bool:
+def vggt_fused_ln_should_replace(parent_module: torch.nn.Module, parent_qualified_name: str, name: str, module:torch.nn.Module) -> bool:
     """
     Replace ONLY LayerNorms that:
-      - Live on a VGGT core block (is_vggt_core_block(parent) is True), and
-      - Are named 'norm1' or 'norm2'.
-
-    This skips:
-      - LayerNorms inside attention (e.g., q_norm, k_norm) because their parent is 'attn', not the block.
-      - LayerNorms in TrackHead/AttnBlock time_blocks, since is_vggt_core_block(parent) will be False.
-      - Any other LayerNorms we did not fuse into.
+      - Are named 'norm1' or 'norm2'
+      - Whose parent module is a VGGT core block within Aggregator frame/global blocks
+    Skips:
+      - q_norm, k_norm in Attention (since their parent is 'attn', not the block)
+      - Any LayerNorms outside Aggregator frame/global blocks
+      - TrackHead/other modules
     """
     if not isinstance(module, torch.nn.LayerNorm):
         return False
-    if not is_vggt_core_block(parent):
+    if not is_vggt_core_block(parent_module, parent_qualified_name):
         return False
     return name in ("norm1", "norm2")
             
@@ -221,6 +267,7 @@ def replace_post_fusion_norms_with_rmsn(model):
             torch.nn.LayerNorm,
             new_module_factory=ln_no_affine_factory,
             should_replace=vggt_fused_ln_should_replace,
+            qualified_name="",
         )
     else:
         raise ValueError(f"Unknown model type: {model_type}")
@@ -234,7 +281,6 @@ def fuse_layer_norms(model):
     # - VGGT: center Conv2d weights along out_channels (per-filter mean over in_channels*kH*kW).
     for W in model_utils.get_embeddings(**kwargs):
         if isinstance(W, torch.nn.Embedding):
-            ipdb.set_trace
             W_ = W.weight.data.double()
             W.weight.data = (W_ - W_.mean(dim=-1, keepdim=True)).to(W.weight.data.dtype)
         elif isinstance(W, torch.nn.Conv2d):#leave this part as we do not intend to rotate conv layer
@@ -301,6 +347,171 @@ def fuse_layer_norms(model):
         fuse_ln_linear(pre_head_ln, [lm_head])
         
     replace_post_fusion_norms_with_rmsn(model)
+    
+def fuse_postlinear_layerscale_into_linear(layerscale: Optional[nn.Module], linear: Optional[nn.Linear]) -> None:
+    """
+    Fuse LayerScale that is applied AFTER a Linear:
+        y = x @ W^T + b
+        z = y * gamma
+    Fuse into Linear as:
+        W' = diag(gamma) @ W   (scale rows / out_features by gamma)
+        b' = gamma * b
+    After fusion, layerscale.gamma is set to ones (identity).
+    """
+    if layerscale is None or linear is None:
+        return
+    if not isinstance(linear, nn.Linear):
+        raise TypeError(f"Expected nn.Linear, got {type(linear)}")
+    if not hasattr(layerscale, "gamma"):
+        return
+
+    W = linear.weight.data  # [out, in]
+    b = linear.bias.data if linear.bias is not None else None
+    gamma = layerscale.gamma.data  # [out]
+
+    if gamma.dim() != 1:
+        raise ValueError(f"layerscale.gamma must be 1-D, got shape {tuple(gamma.shape)}")
+    if W.shape[0] != gamma.shape[0]:
+        raise ValueError(f"Linear out_features ({W.shape[0]}) must match LayerScale dim ({gamma.shape[0]})")
+
+    dev = W.device
+    W_dtype = W.dtype
+
+    W64 = W.to(device=dev, dtype=torch.float64)
+    gamma64 = gamma.to(device=dev, dtype=torch.float64)  # [out]
+
+    # Row-scale: multiply each output row i by gamma[i]
+    W_fused64 = W64 * gamma64.view(-1, 1)
+    linear.weight.data = W_fused64.to(dtype=W_dtype)
+
+    if b is not None:
+        b_dtype = b.dtype
+        b64 = b.to(device=dev, dtype=torch.float64)
+        b_fused64 = b64 * gamma64
+        linear.bias.data = b_fused64.to(dtype=b_dtype)
+
+    # Neutralize the LayerScale op
+    layerscale.gamma.data = torch.ones_like(layerscale.gamma.data)
+
+
+# ---- Model-specific discovery and fusion helpers (unchanged) ----
+
+def fuse_layerscale_after_attn_proj(layer, model_type):
+    """
+    Find attention output Linear and a post-attention LayerScale (ls1), then fuse.
+    Adjust attribute names if your model stores them differently.
+    """
+    attn = getattr(layer, "attn", None) or getattr(layer, "self_attn", None)
+    if attn is None:
+        return
+
+    # Find attention output projection Linear
+    if model_type == model_utils.LLAMA_MODEL:
+        proj = getattr(attn, "o_proj", None)
+    elif model_type == model_utils.OPT_MODEL:
+        proj = getattr(attn, "out_proj", None)
+    elif model_type == model_utils.VGGT_MODEL or isinstance(layer, model_utils.VGGT_MODEL):
+        proj = getattr(attn, "proj", None)
+    else:
+        proj = None
+
+    # Try common places for ls1
+    ls1 = getattr(layer, "ls1", None)
+    if ls1 is None and hasattr(attn, "ls1"):
+        ls1 = getattr(attn, "ls1")
+
+    if isinstance(proj, nn.Linear) and ls1 is not None:
+        fuse_postlinear_layerscale_into_linear(ls1, proj)
+
+
+def fuse_layerscale_after_mlp_fc2(layer, model_type):
+    """
+    Find MLP output Linear and a post-MLP LayerScale (ls2), then fuse.
+    """
+    mlp = getattr(layer, "mlp", None)
+    if mlp is None:
+        return
+
+    # Find MLP output Linear
+    if model_type == model_utils.LLAMA_MODEL:
+        fc2 = getattr(mlp, "down_proj", None)
+    elif model_type == model_utils.OPT_MODEL:
+        fc2 = getattr(layer, "fc2", None) or getattr(mlp, "fc2", None)
+    elif model_type == model_utils.VGGT_MODEL or isinstance(layer, model_utils.VGGT_MODEL):
+        fc2 = getattr(mlp, "fc2", None)
+    else:
+        fc2 = None
+
+    # Try common places for ls2
+    ls2 = getattr(layer, "ls2", None)
+    if ls2 is None and hasattr(mlp, "ls2"):
+        ls2 = getattr(mlp, "ls2")
+
+    if isinstance(fc2, nn.Linear) and ls2 is not None:
+        fuse_postlinear_layerscale_into_linear(ls2, fc2)
+
+
+# ---- New: VGGT-specific layer finder that targets only aggregator.frame_blocks and aggregator.global_blocks ----
+
+def _iter_modulelist_layers(modlist: Optional[nn.Module]) -> Iterable[nn.Module]:
+    if modlist is None:
+        return []
+    if isinstance(modlist, nn.ModuleList):
+        return list(modlist)
+    # Some codebases wrap lists; be defensive
+    try:
+        return list(modlist)
+    except Exception:
+        return []
+
+def get_target_layers_vggt_aggregator_only(model) -> List[nn.Module]:
+    """
+    Return only the Block modules inside:
+      - model.aggregator.frame_blocks
+      - model.aggregator.global_blocks
+    Skip aggregator.patch_embed.blocks and anything else.
+    """
+    layers: List[nn.Module] = []
+    aggregator = getattr(model, "aggregator", None)
+    if aggregator is None:
+        return layers
+
+    # Collect frame_blocks
+    frame_blocks = getattr(aggregator, "frame_blocks", None)
+    layers.extend(_iter_modulelist_layers(frame_blocks))
+
+    # Collect global_blocks
+    global_blocks = getattr(aggregator, "global_blocks", None)
+    layers.extend(_iter_modulelist_layers(global_blocks))
+
+    return layers
+
+
+# ---- Modified top-level fuse function ----
+
+def fuse_layerscales(model):
+    """
+    Walk the model and fuse LayerScale modules that appear AFTER:
+      - Attention output projection (proj/o_proj/out_proj) => fuse ls1 into proj
+      - MLP output projection (fc2/down_proj) => fuse ls2 into fc2
+
+    Restricted for VGGT: only fuse inside aggregator.frame_blocks and aggregator.global_blocks.
+    Other models keep existing traversal behavior via model_utils.get_transformer_layers.
+    """
+    model_type = model_utils.get_model_type(model)
+
+    if model_type == model_utils.VGGT_MODEL or isinstance(model, model_utils.VGGT_MODEL):
+        # Only fuse inside the aggregator's frame and global blocks
+        layers = get_target_layers_vggt_aggregator_only(model)
+    else:
+        # Fallback to original generic traversal
+        kwargs = {'model': model, 'model_type': model_type}
+        layers = model_utils.get_transformer_layers(**kwargs)
+
+    for layer in layers:
+        # ipdb.set_trace()
+        fuse_layerscale_after_attn_proj(layer, model_type)
+        fuse_layerscale_after_mlp_fc2(layer, model_type)
     
 
 def random_orthogonal_matrix(size, device):
@@ -377,6 +588,7 @@ def rotate_attention_inputs(layer, Q, model_type) -> None:
     qkv = getattr(attn, "qkv", None)
     if isinstance(qkv, torch.nn.Linear):
         W = qkv.weight
+        # ipdb.set_trace()
         out_features, in_features = W.shape
         if out_features % 3 != 0:
             raise ValueError(f"qkv weight out_features ({out_features}) not divisible by 3")
@@ -388,22 +600,27 @@ def rotate_attention_inputs(layer, Q, model_type) -> None:
         dev = W.device
         orig_dtype = W.dtype
         W64 = W.data.to(device=dev, dtype=torch.float64)
+        torch.save(W64.detach().cpu(),"qkv_w_o.pt")
         Q64 = Q.to(device=dev, dtype=torch.float64)
 
         # Slice and rotate: Wi <- Wi @ Q
+        # ipdb.set_trace()
         h = hidden
-        Wq = W64[0:h, :] @ Q64
-        Wk = W64[h:2*h, :] @ Q64
-        Wv = W64[2*h:3*h, :] @ Q64
+        Wq_ = W64[0:h, :]
+        Wk_ = W64[h:2*h, :]
+        Wv_ = W64[2*h:3*h, :]
+        Wq = torch.matmul(Wq_, Q).to(device=dev, dtype=orig_dtype)
+        Wk = torch.matmul(Wk_, Q).to(device=dev, dtype=orig_dtype)
+        Wv = torch.matmul(Wv_, Q).to(device=dev, dtype=orig_dtype)
 
         # Stitch back
         W64_rot = torch.empty_like(W64)
         W64_rot[0:h, :] = Wq
         W64_rot[h:2*h, :] = Wk
         W64_rot[2*h:3*h, :] = Wv
+        torch.save(W64_rot.detach().cpu(),"qkv_w_r.pt")
 
         qkv.weight.data = W64_rot.to(device=dev, dtype=orig_dtype)
-        # bias unchanged
         return
 
     # If neither structure is found, do nothing (or raise)
@@ -451,14 +668,19 @@ def rotate_attention_output(layer, Q, model_type) -> None:
     dtype = W.weight.data.dtype
     dev = W.weight.data.device
     W_ = W.weight.data.to(device=dev, dtype=torch.float64)
+    torch.save(W_.detach().cpu(),"proj_w_o.pt")
     Q64 = Q.to(device=dev, dtype=torch.float64)
 
     # Left-multiply by Q^T to rotate output space
-    W.weight.data = (Q64.T @ W_).to(device=dev, dtype=dtype)
-
+    W_rot = torch.matmul(Q64.T, W_).to(device=dev, dtype=dtype)
+    torch.save(W_rot.detach().cpu(),"proj_w_r.pt")
+    W.weight.data = W_rot
     if W.bias is not None:
         b = W.bias.data.to(device=dev, dtype=torch.float64)
-        W.bias.data = (Q64.T @ b).to(device=dev, dtype=dtype)
+        torch.save(b.detach().cpu(),"proj_b_o.pt")
+        b_rot = torch.matmul(Q64.T, b).to(device=dev, dtype=dtype)
+        torch.save(b_rot.detach().cpu(),"proj_b_r.pt")
+        W.bias.data = b_rot
 
 # def rotate_mlp_input(layer, Q, model_type):
 #     # Rotate the MLP input weights.
@@ -474,6 +696,7 @@ def rotate_attention_output(layer, Q, model_type) -> None:
 #         W.weight.data = torch.matmul(W_, Q).to(device="cpu", dtype=dtype)
 
 def rotate_mlp_input(layer, Q, model_type):
+    # ipdb.set_trace()
     # Rotate the MLP input weights.
     if model_type == model_utils.LLAMA_MODEL:
         mlp_inputs = [layer.mlp.up_proj, layer.mlp.gate_proj]
@@ -489,8 +712,11 @@ def rotate_mlp_input(layer, Q, model_type):
         dtype = W.weight.dtype
         dev = W.weight.device
         W_ = W.weight.data.to(device=dev, dtype=torch.float64)
+        torch.save(W_.detach().cpu(),"Win_original.pt")
         Q64 = Q.to(device=dev, dtype=torch.float64)
-        W.weight.data = (W_ @ Q64).to(device=dev, dtype=dtype)
+        W_rotate = torch.matmul(W_, Q64).to(device=dev, dtype=dtype)
+        torch.save(W_rotate.detach().cpu(),"Win_rotate.pt")
+        W.weight.data = W_rotate
     
 # def rotate_mlp_output(layer, Q, model_type):
 #     # Rotate the MLP output weights and bias.
@@ -509,6 +735,7 @@ def rotate_mlp_input(layer, Q, model_type):
 #         W.bias.data = torch.matmul(Q.T, b).to(device="cpu", dtype=dtype)
 
 def rotate_mlp_output(layer, Q, model_type):
+    # ipdb.set_trace()
     # Rotate the MLP output weights and bias.
     if model_type == model_utils.LLAMA_MODEL:
         W = layer.mlp.down_proj
@@ -524,17 +751,20 @@ def rotate_mlp_output(layer, Q, model_type):
     dev = W.weight.data.device
 
     W_ = W.weight.data.to(device=dev, dtype=torch.float64)
+    torch.save(W_.detach().cpu(),"Wout_original.pt")
     Q64 = Q.to(device=dev, dtype=torch.float64)
 
     # Left-multiply by Q^T
-    W.weight.data = (Q64.T @ W_).to(device=dev, dtype=dtype)
-
+    W_rotate = torch.matmul(Q64.T, W_).to(device=dev, dtype=dtype)
+    torch.save(W_rotate.detach().cpu(),"Wout_rotate.pt")
+    W.weight.data = W_rotate
+    # ipdb.set_trace()
     # Apply exact (inverse) Hadamard on the weights of MLP output (unchanged helper)
-    apply_exact_had_to_linear(W, had_dim=-1, output=False)
+    # apply_exact_had_to_linear(W, had_dim=-1, output=False)
 
     if W.bias is not None:
         b = W.bias.data.to(device=dev, dtype=torch.float64)
-        W.bias.data = (Q64.T @ b).to(device=dev, dtype=dtype)
+        W.bias.data = torch.matmul(Q64.T, b).to(device=dev, dtype=dtype)
 
 def matmul_hadU_cuda_had(X, hadK, transpose=False):
     '''
@@ -739,13 +969,17 @@ def rotate_model(model, args):
 
     # Build Q and run rotations
     Q = get_orthogonal_matrix(model_dim, args.rotate_mode)
+    torch.save(Q.detach().cpu(),"Q.pt")
+    # ipdb.set_trace()
+    model.aggregator.set_act_rotation(Q)
     
     for idx, layer in enumerate(tqdm.tqdm(layers, unit="layer", desc="Rotating")):
+        # ipdb.set_trace()
         rotate_attention_inputs(layers[idx], Q, model_type)
         rotate_attention_output(layers[idx], Q, model_type)
         rotate_mlp_input(layers[idx], Q, model_type)
         rotate_mlp_output(layers[idx], Q, model_type)
-        rotate_ov_proj(layers[idx], model_type, num_heads, head_dim)
+        # rotate_ov_proj(layers[idx], model_type, num_heads, head_dim)
 
 
 @torch.inference_mode

@@ -349,31 +349,65 @@ def replace_modules(
         if new_module is not None:
             setattr(root, name, new_module)
             
+# def replace_modules_selective(
+#     root: torch.nn.Module,
+#     type_to_replace: type,
+#     new_module_factory: typing.Callable[[torch.nn.Module, str, typing.Optional[torch.nn.Module]], torch.nn.Module],
+#     should_replace: typing.Callable[[torch.nn.Module, str, typing.Optional[torch.nn.Module]], bool],
+# ) -> None:
+#     """
+#     Depth-first replacement with a filter. Only replaces modules of type_to_replace
+#     for which should_replace(parent, name, module) returns True.
+
+#     Args:
+#       root: root module to traverse
+#       type_to_replace: class to match (e.g., torch.nn.LayerNorm)
+#       new_module_factory: function (parent, name, module) -> replacement module
+#       should_replace: predicate (parent, name, module) -> bool
+#     """
+#     for name, module in list(root.named_children()):
+#         # Recurse first so we can still visit grandchildren if we don't replace this node
+#         replace_modules_selective(module, type_to_replace, new_module_factory, should_replace)
+
+#         if isinstance(module, type_to_replace) and should_replace(root, name, module):
+#             new_module = new_module_factory(root, name, module)
+#             setattr(root, name, new_module)
+
 def replace_modules_selective(
     root: torch.nn.Module,
     type_to_replace: type,
-    new_module_factory: typing.Callable[[torch.nn.Module, str, typing.Optional[torch.nn.Module]], torch.nn.Module],
-    should_replace: typing.Callable[[torch.nn.Module, str, typing.Optional[torch.nn.Module]], bool],
+    new_module_factory: typing.Callable[[torch.nn.Module, str, torch.nn.Module], torch.nn.Module],
+    should_replace: typing.Callable[[torch.nn.Module, str, str, torch.nn.Module], bool],
+    qualified_name: str = "",
 ) -> None:
     """
     Depth-first replacement with a filter. Only replaces modules of type_to_replace
-    for which should_replace(parent, name, module) returns True.
+    for which should_replace(parent, parent_qualified_name, child_name, child_module) returns True.
 
     Args:
-      root: root module to traverse
-      type_to_replace: class to match (e.g., torch.nn.LayerNorm)
-      new_module_factory: function (parent, name, module) -> replacement module
-      should_replace: predicate (parent, name, module) -> bool
+      root: current parent module in traversal
+      type_to_replace: class to match (e.g., nn.LayerNorm)
+      new_module_factory: function (parent, child_name, child_module) -> replacement module
+      should_replace: predicate (parent, parent_qualified_name, child_name, child_module) -> bool
+      qualified_name: fully qualified path of 'root' within the whole model
     """
-    for name, module in list(root.named_children()):
-        # Recurse first so we can still visit grandchildren if we don't replace this node
-        replace_modules_selective(module, type_to_replace, new_module_factory, should_replace)
+    # We must list children first because we might replace attributes while iterating
+    for child_name, child_module in list(root.named_children()):
+        child_qn = f"{qualified_name}.{child_name}" if qualified_name else child_name
 
-        if isinstance(module, type_to_replace) and should_replace(root, name, module):
-            new_module = new_module_factory(root, name, module)
-            setattr(root, name, new_module)
+        # Recurse before replacement so grandchildren are visited regardless
+        replace_modules_selective(
+            child_module,
+            type_to_replace,
+            new_module_factory,
+            should_replace,
+            qualified_name=child_qn,
+        )
 
-
+        # Decide replacement on the child sitting under 'root'
+        if isinstance(child_module, type_to_replace) and should_replace(root, qualified_name, child_name, child_module):
+            new_module = new_module_factory(root, child_name, child_module)
+            setattr(root, child_name, new_module)
 
 class RMSN(torch.nn.Module):
     """
@@ -396,47 +430,47 @@ class RMSN(torch.nn.Module):
         x = x * torch.rsqrt(variance + self.eps)
         return x.to(input_dtype)
     
-# class LNNoAffine(torch.nn.Module):
-#     """
-#     LayerNorm without affine parameters, used to replace LayerNorm after
-#     folding gamma/beta into adjacent Linear layers.
-
-#     Equivalent to torch.nn.LayerNorm(normalized_shape, eps=eps, elementwise_affine=False),
-#     but implemented explicitly to avoid relying on newer PyTorch features.
-#     """
-
-#     def __init__(self, normalized_shape, eps=1e-5):
-#         super().__init__()
-#         if isinstance(normalized_shape, int):
-#             normalized_shape = (normalized_shape,)
-#         self.normalized_shape = tuple(normalized_shape)
-#         self.eps = eps
-
-#     def forward(self, x: torch.Tensor) -> torch.Tensor:
-#         # Normalize over the last len(normalized_shape) dims, like torch LayerNorm
-#         input_dtype = x.dtype
-#         if x.dtype == torch.float16:
-#             x = x.to(torch.float32)
-#         dims = tuple(range(-len(self.normalized_shape), 0))
-#         mean = x.mean(dim=dims, keepdim=True)
-#         var = x.var(dim=dims, unbiased=False, keepdim=True)
-#         x_hat = (x - mean) / torch.sqrt(var + self.eps)
-#         return x_hat.to(input_dtype)
-
 class LNNoAffine(torch.nn.Module):
-    def __init__(self, normalized_shape, eps=1e-5, upcast_fp16=True):
+    """
+    LayerNorm without affine parameters, used to replace LayerNorm after
+    folding gamma/beta into adjacent Linear layers.
+
+    Equivalent to torch.nn.LayerNorm(normalized_shape, eps=eps, elementwise_affine=False),
+    but implemented explicitly to avoid relying on newer PyTorch features.
+    """
+
+    def __init__(self, normalized_shape, eps=1e-5):
         super().__init__()
         if isinstance(normalized_shape, int):
             normalized_shape = (normalized_shape,)
-        self.norm = torch.nn.LayerNorm(normalized_shape, eps=eps, elementwise_affine=False)
-        self.upcast_fp16 = upcast_fp16
+        self.normalized_shape = tuple(normalized_shape)
+        self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        orig_dtype = x.dtype
-        if self.upcast_fp16 and x.dtype == torch.float16:
+        # Normalize over the last len(normalized_shape) dims, like torch LayerNorm
+        input_dtype = x.dtype
+        if x.dtype == torch.float16:
             x = x.to(torch.float32)
-        y = self.norm(x)
-        return y.to(orig_dtype)
+        dims = tuple(range(-len(self.normalized_shape), 0))
+        mean = x.mean(dim=dims, keepdim=True)
+        var = x.var(dim=dims, unbiased=False, keepdim=True)
+        x_hat = (x - mean) / torch.sqrt(var + self.eps)
+        return x_hat.to(input_dtype)
+
+# class LNNoAffine(torch.nn.Module):
+#     def __init__(self, normalized_shape, eps=1e-5, upcast_fp16=True):
+#         super().__init__()
+#         if isinstance(normalized_shape, int):
+#             normalized_shape = (normalized_shape,)
+#         self.norm = torch.nn.LayerNorm(normalized_shape, eps=eps, elementwise_affine=False)
+#         self.upcast_fp16 = upcast_fp16
+
+#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#         orig_dtype = x.dtype
+#         if self.upcast_fp16 and x.dtype == torch.float16:
+#             x = x.to(torch.float32)
+#         y = self.norm(x)
+#         return y.to(orig_dtype)
 
 
 def get_layer_io_save_path(args):
