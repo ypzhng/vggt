@@ -46,7 +46,9 @@ class Attention(nn.Module):
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim, bias=proj_bias)
         self.proj_drop = nn.Dropout(proj_drop)
-        self.rope = rope
+        # self.rope = rope
+        self.rope_q = rope
+        self.rope_k = rope
 
     def forward(self, x: Tensor, pos=None) -> Tensor:
         B, N, C = x.shape
@@ -54,9 +56,13 @@ class Attention(nn.Module):
         q, k, v = qkv.unbind(0)
         q, k = self.q_norm(q), self.k_norm(k)
 
-        if self.rope is not None:
-            q = self.rope(q, pos)
-            k = self.rope(k, pos)
+        # if self.rope is not None:
+        #     q = self.rope(q, pos)
+        #     k = self.rope(k, pos)
+        if self.rope_q is not None:
+            q = self.rope_q(q, pos)
+        if self.rope_k is not None:
+            k = self.rope_k(k, pos)
 
         if self.fused_attn:
             x = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0)

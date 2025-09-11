@@ -7,7 +7,7 @@ from . import utils
 import transformers
 import tqdm, math
 import ipdb
-# from vggt.utils import quant_utils
+from vggt.utils import quant_utils
 from vggt.utils.hadamard_utils import random_hadamard_matrix, apply_exact_had_to_linear, is_pow2
 from fast_hadamard_transform import hadamard_transform
 
@@ -600,7 +600,7 @@ def rotate_attention_inputs(layer, Q, model_type) -> None:
         dev = W.device
         orig_dtype = W.dtype
         W64 = W.data.to(device=dev, dtype=torch.float64)
-        torch.save(W64.detach().cpu(),"qkv_w_o.pt")
+        # torch.save(W64.detach().cpu(),"qkv_w_o.pt")
         Q64 = Q.to(device=dev, dtype=torch.float64)
 
         # Slice and rotate: Wi <- Wi @ Q
@@ -618,7 +618,7 @@ def rotate_attention_inputs(layer, Q, model_type) -> None:
         W64_rot[0:h, :] = Wq
         W64_rot[h:2*h, :] = Wk
         W64_rot[2*h:3*h, :] = Wv
-        torch.save(W64_rot.detach().cpu(),"qkv_w_r.pt")
+        # torch.save(W64_rot.detach().cpu(),"qkv_w_r.pt")
 
         qkv.weight.data = W64_rot.to(device=dev, dtype=orig_dtype)
         return
@@ -668,18 +668,18 @@ def rotate_attention_output(layer, Q, model_type) -> None:
     dtype = W.weight.data.dtype
     dev = W.weight.data.device
     W_ = W.weight.data.to(device=dev, dtype=torch.float64)
-    torch.save(W_.detach().cpu(),"proj_w_o.pt")
+    # torch.save(W_.detach().cpu(),"proj_w_o.pt")
     Q64 = Q.to(device=dev, dtype=torch.float64)
 
     # Left-multiply by Q^T to rotate output space
     W_rot = torch.matmul(Q64.T, W_).to(device=dev, dtype=dtype)
-    torch.save(W_rot.detach().cpu(),"proj_w_r.pt")
+    # torch.save(W_rot.detach().cpu(),"proj_w_r.pt")
     W.weight.data = W_rot
     if W.bias is not None:
         b = W.bias.data.to(device=dev, dtype=torch.float64)
-        torch.save(b.detach().cpu(),"proj_b_o.pt")
+        # torch.save(b.detach().cpu(),"proj_b_o.pt")
         b_rot = torch.matmul(Q64.T, b).to(device=dev, dtype=dtype)
-        torch.save(b_rot.detach().cpu(),"proj_b_r.pt")
+        # torch.save(b_rot.detach().cpu(),"proj_b_r.pt")
         W.bias.data = b_rot
 
 # def rotate_mlp_input(layer, Q, model_type):
@@ -712,10 +712,10 @@ def rotate_mlp_input(layer, Q, model_type):
         dtype = W.weight.dtype
         dev = W.weight.device
         W_ = W.weight.data.to(device=dev, dtype=torch.float64)
-        torch.save(W_.detach().cpu(),"Win_original.pt")
+        # torch.save(W_.detach().cpu(),"Win_original.pt")
         Q64 = Q.to(device=dev, dtype=torch.float64)
         W_rotate = torch.matmul(W_, Q64).to(device=dev, dtype=dtype)
-        torch.save(W_rotate.detach().cpu(),"Win_rotate.pt")
+        # torch.save(W_rotate.detach().cpu(),"Win_rotate.pt")
         W.weight.data = W_rotate
     
 # def rotate_mlp_output(layer, Q, model_type):
@@ -751,16 +751,16 @@ def rotate_mlp_output(layer, Q, model_type):
     dev = W.weight.data.device
 
     W_ = W.weight.data.to(device=dev, dtype=torch.float64)
-    torch.save(W_.detach().cpu(),"Wout_original.pt")
+    # torch.save(W_.detach().cpu(),"Wout_original.pt")
     Q64 = Q.to(device=dev, dtype=torch.float64)
 
     # Left-multiply by Q^T
     W_rotate = torch.matmul(Q64.T, W_).to(device=dev, dtype=dtype)
-    torch.save(W_rotate.detach().cpu(),"Wout_rotate.pt")
+    # torch.save(W_rotate.detach().cpu(),"Wout_rotate.pt")
     W.weight.data = W_rotate
     # ipdb.set_trace()
     # Apply exact (inverse) Hadamard on the weights of MLP output (unchanged helper)
-    # apply_exact_had_to_linear(W, had_dim=-1, output=False)
+    apply_exact_had_to_linear(W, had_dim=-1, output=False)
 
     if W.bias is not None:
         b = W.bias.data.to(device=dev, dtype=torch.float64)
@@ -969,7 +969,7 @@ def rotate_model(model, args):
 
     # Build Q and run rotations
     Q = get_orthogonal_matrix(model_dim, args.rotate_mode)
-    torch.save(Q.detach().cpu(),"Q.pt")
+    # torch.save(Q.detach().cpu(),"Q.pt")
     # ipdb.set_trace()
     model.aggregator.set_act_rotation(Q)
     
@@ -979,7 +979,7 @@ def rotate_model(model, args):
         rotate_attention_output(layers[idx], Q, model_type)
         rotate_mlp_input(layers[idx], Q, model_type)
         rotate_mlp_output(layers[idx], Q, model_type)
-        # rotate_ov_proj(layers[idx], model_type, num_heads, head_dim)
+        rotate_ov_proj(layers[idx], model_type, num_heads, head_dim)
 
 
 @torch.inference_mode
@@ -997,58 +997,147 @@ def register_online_rotation(module, Q:torch.Tensor):
 
 
 class QKRotationWrapper(torch.nn.Module):
-
-    def __init__(self, func, config, *args, **kwargs):
+    def __init__(self, func, config=None, *, role="q", num_heads=None, model_dim=None, head_dim=None,
+                 k_bits=16, k_groupsize=-1, k_sym=True, k_clip_ratio=1.0):
+        """
+        func: original rope(t, pos) -> t_rotated
+        role: "q" or "k". Only "k" applies quantization. Both apply Hadamard rotation.
+        """
         super().__init__()
-        self.config = config
-        num_heads = config.num_attention_heads
-        model_dim = config.hidden_size
-        head_dim = model_dim // num_heads
-        assert is_pow2(head_dim), f'Only power of 2 head_dim is supported for K-cache Quantization!'
+        assert role in ("q", "k"), "role must be 'q' or 'k'"
         self.func = func
+        self.config = config
+        self.role = role
+
+        # dims
+        self._num_heads = num_heads
+        self._model_dim = model_dim
+        self._head_dim = head_dim
+        if self.config is not None:
+            nh = getattr(self.config, "num_attention_heads", None)
+            hs = getattr(self.config, "hidden_size", None)
+            if self._num_heads is None and nh is not None:
+                self._num_heads = nh
+            if self._model_dim is None and hs is not None:
+                self._model_dim = hs
+            if self._head_dim is None and self._num_heads and self._model_dim:
+                self._head_dim = self._model_dim // self._num_heads
+
+        # quant settings (used only for role=="k")
+        self.k_bits = k_bits
+        self.k_groupsize = k_groupsize
+        self.k_sym = k_sym
+        self.k_clip_ratio = k_clip_ratio
+
         self.k_quantizer = quant_utils.ActQuantizer()
-        self.k_bits = 16
-        if kwargs is not None:
-            assert kwargs['k_groupsize'] in [-1, head_dim], f'Only token-wise/{head_dim}g quantization is supported for K-cache'
-            self.k_bits = kwargs['k_bits']
-            self.k_groupsize = kwargs['k_groupsize']
-            self.k_sym = kwargs['k_sym']
-            self.k_clip_ratio = kwargs['k_clip_ratio']
-            self.k_quantizer.configure(bits=self.k_bits, groupsize=-1, #we put -1 to be toke-wise quantization and handle head-wise quantization by ourself
-                                   sym=self.k_sym, clip_ratio=self.k_clip_ratio)
+        self.k_quantizer.configure(bits=self.k_bits, groupsize=-1, sym=self.k_sym, clip_ratio=self.k_clip_ratio)
 
-    def forward(self, *args, **kwargs):
-        q, k = self.func(*args, **kwargs)
-        dtype = q.dtype
-        q = hadamard_transform(q.float(), scale=1/math.sqrt(q.shape[-1])).to(dtype)
-        k = hadamard_transform(k.float(), scale=1/math.sqrt(k.shape[-1])).to(dtype)
-        (bsz, num_heads, seq_len, head_dim) = k.shape
-        
+        if self._head_dim is not None:
+            assert is_pow2(self._head_dim), "Only power of 2 head_dim is supported for K-cache Quantization!"
+            if self.k_groupsize not in (-1, self._head_dim):
+                raise AssertionError(f"Only token-wise/-1 or head-wise/{self._head_dim}g is supported for K-cache")
 
-        if self.k_groupsize == -1: #token-wise quantization
-            token_wise_k = k.transpose(1, 2).reshape(-1, self.config.hidden_size)
-            self.k_quantizer.find_params(token_wise_k)
-            k = self.k_quantizer(token_wise_k).reshape((bsz, seq_len, num_heads, head_dim)).transpose(1, 2).to(q)
-        else: #head-wise quantization
-            per_head_k = k.view(-1, head_dim)
-            self.k_quantizer.find_params(per_head_k)
-            k = self.k_quantizer(per_head_k).reshape((bsz, num_heads, seq_len, head_dim)).to(q)
-        
-        self.k_quantizer.free()
-            
-        return q, k
+    def _ensure_dims_from_tensor(self, t):
+        # t expected shape: (B, H, T, Dh)
+        if t.ndim == 4:
+            _, H, _, Dh = t.shape
+            if self._num_heads is None:
+                self._num_heads = H
+            if self._head_dim is None:
+                self._head_dim = Dh
+            if self._model_dim is None and self._num_heads is not None and self._head_dim is not None:
+                self._model_dim = self._num_heads * self._head_dim
+        assert self._num_heads and self._head_dim and self._model_dim, "Cannot infer attention dims"
+        assert is_pow2(self._head_dim), "Only power of 2 head_dim is supported"
+        if self.k_groupsize not in (-1, self._head_dim):
+            raise AssertionError(f"Only token-wise/-1 or head-wise/{self._head_dim}g is supported")
+
+    def forward(self, t, pos=None):
+        # Call original rope for this stream (q or k)
+        t = self.func(t, pos)
+
+        # Apply Hadamard to both Q and K
+        dtype = t.dtype
+        t = hadamard_transform(t.float(), scale=1 / math.sqrt(t.shape[-1])).to(dtype)
+
+        # Only K path gets quantized
+        if self.role == "k" and self.k_bits < 16:
+            self._ensure_dims_from_tensor(t)
+            bsz, num_heads, seq_len, head_dim = t.shape
+            if self.k_groupsize == -1:
+                # token-wise over model_dim
+                flat = t.transpose(1, 2).reshape(-1, self._model_dim)
+                self.k_quantizer.find_params(flat)
+                tq = self.k_quantizer(flat).reshape(bsz, seq_len, num_heads, head_dim).transpose(1, 2).to(t)
+            else:
+                # head-wise over Dh
+                flat = t.reshape(-1, head_dim)
+                self.k_quantizer.find_params(flat)
+                tq = self.k_quantizer(flat).reshape(bsz, num_heads, seq_len, head_dim).to(t)
+            self.k_quantizer.free()
+            t = tq
+
+        return t
 
 
+
+# def add_qk_rotation_wrapper_after_function_call_in_forward(module, function_name, *args, **kwargs):
+#     '''
+#     This function adds a rotation wrapper after the output of a function call in forward. 
+#     Only calls directly in the forward function are affected. calls by other functions called in forward are not affected.
+#     '''
+#     from . import monkeypatch
+#     import functools
+#     attr_name = f"{function_name}_qk_rotation_wrapper"
+#     assert not hasattr(module, attr_name)
+#     wrapper = monkeypatch.add_wrapper_after_function_call_in_method(module, "forward",
+#                                                                     function_name, functools.partial(QKRotationWrapper, *args, **kwargs))
+#     setattr(module, attr_name, wrapper)
 
 def add_qk_rotation_wrapper_after_function_call_in_forward(module, function_name, *args, **kwargs):
-    '''
-    This function adds a rotation wrapper after the output of a function call in forward. 
-    Only calls directly in the forward function are affected. calls by other functions called in forward are not affected.
-    '''
-    import monkeypatch
-    import functools
-    attr_name = f"{function_name}_qk_rotation_wrapper"
-    assert not hasattr(module, attr_name)
-    wrapper = monkeypatch.add_wrapper_after_function_call_in_method(module, "forward",
-                                                                    function_name, functools.partial(QKRotationWrapper, *args, **kwargs))
-    setattr(module, attr_name, wrapper)
+    """
+    Install Q and K rotation/quantization wrappers for a unary rope function used twice in forward.
+
+    Preconditions:
+      - The target module's forward calls function_name(t, pos) for q and for k.
+      - You have modified the module to use `self.rope_q` and `self.rope_k` in forward.
+
+    This will:
+      - Initialize self.rope_q/self.rope_k if missing.
+      - Wrap rope_q with role="q" (Hadamard only).
+      - Wrap rope_k with role="k" (Hadamard + optional K quantization).
+    """
+    # Verify function_name exists on module (e.g., "rope")
+    if not hasattr(module, function_name):
+        raise AttributeError(f"Module {type(module).__name__} has no attribute '{function_name}' to wrap")
+
+    base_func = getattr(module, function_name)
+
+    # Ensure rope_q and rope_k attributes exist; default to the base func
+    if not hasattr(module, "rope_q"):
+        setattr(module, "rope_q", base_func)
+    if not hasattr(module, "rope_k"):
+        setattr(module, "rope_k", base_func)
+
+    # Prevent double wrapping
+    if isinstance(getattr(module, "rope_q"), QKRotationWrapper) or isinstance(getattr(module, "rope_k"), QKRotationWrapper):
+        # Already wrapped; skip
+        return
+
+    # Build Q wrapper (role="q") and K wrapper (role="k")
+    # We pass through all provided args/kwargs plus the role flag
+    q_kwargs = dict(kwargs)
+    q_kwargs["role"] = "q"
+    k_kwargs = dict(kwargs)
+    k_kwargs["role"] = "k"
+
+    rope_q_wrapped = QKRotationWrapper(getattr(module, "rope_q"), *args, **q_kwargs)
+    rope_k_wrapped = QKRotationWrapper(getattr(module, "rope_k"), *args, **k_kwargs)
+
+    # Attach to module
+    setattr(module, "rope_q", rope_q_wrapped)
+    setattr(module, "rope_k", rope_k_wrapped)
+
+    # Keep a reference for potential cleanup/debugging
+    setattr(module, f"{function_name}_q_rotation_wrapper", rope_q_wrapped)
+    setattr(module, f"{function_name}_k_rotation_wrapper", rope_k_wrapped)
