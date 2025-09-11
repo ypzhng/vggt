@@ -25,6 +25,7 @@ from vggt.utils import utils
 from vggt.utils import quant_utils
 from vggt.utils import hadamard_utils
 from vggt.utils import model_utils
+from vggt.utils import gptq_utils
 import argparse
 
 
@@ -225,6 +226,64 @@ def setup_args():
     parser.add_argument('--rotate_mode', type=str, default='hadamard', choices=['hadamard', 'random'])
     parser.add_argument('--fp32_had', action=argparse.BooleanOptionalAction, default=False,
                         help='Apply Hadamard rotation in FP32 (default: False)')
+    # Activation Quantization Arguments
+    parser.add_argument('--a_bits', type=int, default=4,
+                        help='''Number of bits for inputs of the Linear layers. This will be
+                        for all the linear layers in the model (including down-projection and out-projection)''')
+    parser.add_argument('--a_groupsize', type=int, default=-1, 
+                        help='Groupsize for activation quantization. Note that this should be the same as w_groupsize')
+    parser.add_argument('--a_asym', action=argparse.BooleanOptionalAction, default=False,
+                        help='ASymmetric Activation quantization (default: False)')
+    parser.add_argument('--a_clip_ratio', type=float, default=1.0,
+        help='Clip ratio for activation quantization. new_max = max * clip_ratio')
+    # Weight Quantization Arguments
+    parser.add_argument('--w_bits', type=int, default=4, 
+                        help='Number of bits for weights of the Linear layers')
+    parser.add_argument('--w_groupsize', type=int, default=-1, 
+                        help='Groupsize for weight quantization. Note that this should be the same as a_groupsize')
+    parser.add_argument('--w_asym', action=argparse.BooleanOptionalAction, default=False,
+                        help='ASymmetric weight quantization (default: False)')
+    parser.add_argument('--w_rtn', action=argparse.BooleanOptionalAction, default=False,
+                        help='Quantize the weights using RtN. If the w_bits < 16 and this flag is not set, we use GPTQ')
+    parser.add_argument('--w_clip', action=argparse.BooleanOptionalAction, default=False,
+                        help='''Clipping the weight quantization! 
+                        We do not support arguments for clipping and we find the best clip ratio during the weight quantization''')
+    parser.add_argument('--nsamples', type=int, default=128,
+                        help='Number of calibration data samples for GPTQ.')
+    # parser.add_argument('--cal_dataset', type=str, default='wikitext2',
+    #                     help='calibration data samples for GPTQ.', choices=supported_datasets)
+    parser.add_argument('--percdamp', type=float, default=.01,
+                        help='Percent of the average Hessian diagonal to use for dampening.')
+    parser.add_argument('--act_order', action=argparse.BooleanOptionalAction, default=False,
+                        help='act-order in GPTQ')
+    # General Quantization Arguments
+    parser.add_argument('--int8_down_proj', action=argparse.BooleanOptionalAction, default=False,
+                        help='Use INT8 for Down Projection! If this set, both weights and activations of this layer will be in INT8')
+    # KV-Cache Quantization Arguments
+    parser.add_argument('--v_bits', type=int, default=4,
+                        help='''Number of bits for V-cache quantization. 
+                        Note that quantizing the V-cache does not need any other rotation''')
+    parser.add_argument('--v_groupsize', type=int, default=-1)
+    parser.add_argument('--v_asym', action=argparse.BooleanOptionalAction, default=False,
+                        help='ASymmetric V-cache quantization')
+    parser.add_argument('--v_clip_ratio', type=float, default=1.0,
+        help='Clip ratio for v-cache quantization. new_max = max * clip_ratio')
+    
+    parser.add_argument('--k_bits', type=int, default=4,
+                        help='''Number of bits for K-cache quantization. 
+                        Note that quantizing the K-cache needs another rotation for the keys/queries''')
+    parser.add_argument('--k_groupsize', type=int, default=-1)
+    parser.add_argument('--k_asym', action=argparse.BooleanOptionalAction, default=False, 
+                        help='ASymmetric K-cache quantization')
+    parser.add_argument('--k_pre_rope', action=argparse.BooleanOptionalAction, default=False, 
+                        help='Pre-RoPE quantization for K-cache (not Supported yet!)')
+    parser.add_argument('--k_clip_ratio', type=float, default=1.0,
+        help='Clip ratio for k-cache quantization. new_max = max * clip_ratio')
+    # Save/Load Quantized Model Arguments
+    parser.add_argument('--load_qmodel_path', type=str, default=None,
+                        help='Load the quantized model from the specified path!')
+    parser.add_argument('--save_qmodel_path', type=str, default=None, 
+                        help='Save the quantized model to the specified path!')
     return parser.parse_args()
 
 
@@ -344,6 +403,34 @@ def process_sequence(model, seq_name, seq_data, category, co3d_dir, min_num_imag
         print(f"{category} sequence {seq_name} T_ACC@5: {Tacc_5:.4f}")
 
         return rel_rangle_deg.cpu().numpy(), rel_tangle_deg.cpu().numpy()
+    
+def iter_vggt_agg_blocks(model):
+    """
+    Yield transformer blocks only from:
+      - model.aggregator.frame_blocks
+      - model.aggregator.global_blocks
+    """
+    agg = getattr(model, "aggregator", None)
+    if agg is None:
+        return
+    for list_name in ("frame_blocks", "global_blocks"):
+        modlist = getattr(agg, list_name, None)
+        if isinstance(modlist, torch.nn.ModuleList):
+            for block in modlist:
+                yield block
+
+def vggt_find_act_wrappers_in_agg_attn(model, quant_utils, allow_names):
+    """
+    Return name->ActQuantWrapper for modules under aggregator.frame_blocks/global_blocks only.
+    Assumes you already wrapped the attention modules under these paths.
+    """
+    all_wrappers = quant_utils.find_qlayers(model, allow_names)
+    # Filter to aggregator frame/global paths only
+    keep = {}
+    for name, wrapper in all_wrappers.items():
+        if name.startswith("aggregator.frame_blocks.") or name.startswith("aggregator.global_blocks."):
+            keep[name] = wrapper
+    return keep
 
 
 def main():
@@ -366,28 +453,111 @@ def main():
         rotation_utils.fuse_layer_norms(model)
         rotation_utils.fuse_layerscales(model)
         rotation_utils.rotate_model(model, args)
-        # utils.cleanup_memory(verbos=True)
-        # ipdb.set_trace()
-        # allow_names = quant_utils.build_aggregator_linear_allowlist(model)
-        # quant_utils.add_actquant(model,allow_names=allow_names)
-        # qlayers = quant_utils.find_qlayers(model,allow_names)
-        # hidden_size, num_heads, intermediate_size = model_utils.get_model_sizes(model)
-        # head_dim = hidden_size // num_heads
-        # for name in qlayers:
-        #     if 'mlp' in name and 'fc2' in name:
-        #         had_K, K = hadamard_utils.get_hadK(intermediate_size)
-        #         qlayers[name].online_full_had = False #for debug only, default setting is True
-        #         qlayers[name].had_K = had_K
-        #         qlayers[name].K = K
-        #         qlayers[name].fp32_had = args.fp32_had
-        #     if 'attn' in name and 'proj' in name:
-        #         had_K, K = hadamard_utils.get_hadK(num_heads)
-        #         qlayers[name].online_partial_had = False #for debug only, default setting is True
-        #         qlayers[name].had_K = had_K
-        #         qlayers[name].K = K
-        #         qlayers[name].had_dim = head_dim
-        #         qlayers[name].fp32_had = args.fp32_had
+        utils.cleanup_memory(verbos=True)
+        ipdb.set_trace()
+        allow_names = quant_utils.build_aggregator_linear_allowlist(model)
+        quant_utils.add_actquant(model,allow_names=allow_names)
+        qlayers = quant_utils.find_qlayers(model,allow_names)
+        hidden_size, num_heads, intermediate_size = model_utils.get_model_sizes(model)
+        head_dim = hidden_size // num_heads
+        for name in qlayers:
+            if 'mlp' in name and 'fc2' in name:
+                had_K, K = hadamard_utils.get_hadK(intermediate_size)
+                qlayers[name].online_full_had = True #for debug only, default setting is True
+                qlayers[name].had_K = had_K
+                qlayers[name].K = K
+                qlayers[name].fp32_had = args.fp32_had
+            if 'attn' in name and 'proj' in name:
+                had_K, K = hadamard_utils.get_hadK(num_heads)
+                qlayers[name].online_partial_had = True #for debug only, default setting is True
+                qlayers[name].had_K = had_K
+                qlayers[name].K = K
+                qlayers[name].had_dim = head_dim
+                qlayers[name].fp32_had = args.fp32_had
     
+    
+    if args.w_bits < 16:
+        save_dict = {}
+        if args.load_qmodel_path:
+            assert args.rotate, "Model should be rotated to load a quantized model!"
+            assert not args.save_qmodel_path, "Cannot save a quantized model if it is already loaded!"
+            print("Load quantized model from ", args.load_qmodel_path)
+            save_dict = torch.load(args.load_qmodel_path, map_location="cpu")
+            model.load_state_dict(save_dict["model"], strict=True)
+        else:
+            # Force RTN; GPTQ not supported for VGGT
+            quantizers = gptq_utils.rtn_fwrd(model, utils.DEV, args)
+            save_dict["w_quantizers"] = quantizers
+
+        if args.save_qmodel_path:
+            save_dict["model"] = model.state_dict()
+            torch.save(save_dict, args.save_qmodel_path)
+
+    # ---- Activation quantization for aggregator attention only ----
+    if args.a_bits < 16 or args.v_bits < 16:
+        qlayers = vggt_find_act_wrappers_in_agg_attn(model, quant_utils, allow_names)
+
+        for name, wrapper in qlayers.items():
+            # Defaults from args
+            layer_bits = args.a_bits
+            layer_groupsize = args.a_groupsize
+            layer_sym = not args.a_asym
+            layer_clip = args.a_clip_ratio
+
+            # Optional: special-case MLP fc2 if your wrappers include it; otherwise attention-only.
+            if ".mlp.fc2" in name and getattr(args, "int8_down_proj", False):
+                layer_bits = 8
+
+            # v_bits targeting: apply to attention output projection wrapper
+            # We check module path ends with '.attn.proj'
+            if args.v_bits < 16 and name.endswith(".attn.proj"):
+                if hasattr(wrapper, "out_quantizer"):
+                    wrapper.out_quantizer.configure(bits=args.v_bits,
+                                                    groupsize=args.v_groupsize,
+                                                    sym=not args.v_asym,
+                                                    clip_ratio=args.v_clip_ratio)
+                else:
+                    # Fallback if only a single quantizer exists on the wrapper
+                    wrapper.quantizer.configure(bits=args.v_bits,
+                                                groupsize=args.v_groupsize,
+                                                sym=not args.v_asym,
+                                                clip_ratio=args.v_clip_ratio)
+                    # Avoid overriding with a_bits below
+                    continue
+
+            # Configure the input quantizer
+            wrapper.quantizer.configure(bits=layer_bits,
+                                        groupsize=layer_groupsize,
+                                        sym=layer_sym,
+                                        clip_ratio=layer_clip)
+
+    # ---- K quantization post-RoPE for aggregator attention only ----
+    if args.k_bits < 16:
+        if getattr(args, "k_pre_rope", False):
+            raise NotImplementedError("Pre-RoPE quantization is not supported yet!")
+        k_quant_config = {
+            "k_bits": args.k_bits,
+            "k_groupsize": args.k_groupsize,
+            "k_sym": not args.k_asym,
+            "k_clip_ratio": args.k_clip_ratio,
+        }
+        rope_attr = "rope"  # single rope function name for VGGT aggregator attention
+
+        for block in iter_vggt_agg_blocks(model):
+            attn = getattr(block, "attn", None)
+            if attn is None or not hasattr(attn, rope_attr):
+                continue
+            rotation_utils.add_qk_rotation_wrapper_after_function_call_in_forward(
+                attn, "rope",
+                config=getattr(model, "config", None),
+                num_heads=num_heads,
+                model_dim=hidden_size,
+                head_dim=head_dim,
+                k_bits=args.k_bits,
+                k_groupsize=args.k_groupsize,
+                k_sym=not args.k_asym,
+                k_clip_ratio=args.k_clip_ratio
+            )
 
     # Categories to evaluate
     SEEN_CATEGORIES = [
