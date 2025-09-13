@@ -859,7 +859,7 @@ def rotate_ov_proj(layer, model_type, head_num, head_dim):
         tmp_v.weight.data = W[v_start:v_end, :].to(device=dev, dtype=dtype).clone()
         if B is not None:
             tmp_v.bias.data = B[v_start:v_end].to(device=dev, dtype=dtype).clone()
-
+        # ipdb.set_trace()
         # Apply Hadamard to V projection (output=True matches original intent on v_proj)
         apply_exact_had_to_linear(tmp_v, had_dim=head_dim, output=True)
 

@@ -227,7 +227,7 @@ class ActQuantWrapper(torch.nn.Module):
             
         elif self.online_partial_had:
             # todo: implement this in QAttention to avoid reshaping!
-            
+            # ipdb.set_trace()
             if self.fp32_had:
                 x = x.float()
                 

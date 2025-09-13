@@ -232,7 +232,7 @@ def setup_args():
                         for all the linear layers in the model (including down-projection and out-projection)''')
     parser.add_argument('--a_groupsize', type=int, default=-1, 
                         help='Groupsize for activation quantization. Note that this should be the same as w_groupsize')
-    parser.add_argument('--a_asym', action=argparse.BooleanOptionalAction, default=False,
+    parser.add_argument('--a_asym', action=argparse.BooleanOptionalAction, default=True,
                         help='ASymmetric Activation quantization (default: False)')
     parser.add_argument('--a_clip_ratio', type=float, default=1.0,
         help='Clip ratio for activation quantization. new_max = max * clip_ratio')
@@ -243,9 +243,9 @@ def setup_args():
                         help='Groupsize for weight quantization. Note that this should be the same as a_groupsize')
     parser.add_argument('--w_asym', action=argparse.BooleanOptionalAction, default=False,
                         help='ASymmetric weight quantization (default: False)')
-    parser.add_argument('--w_rtn', action=argparse.BooleanOptionalAction, default=False,
+    parser.add_argument('--w_rtn', action=argparse.BooleanOptionalAction, default=True,
                         help='Quantize the weights using RtN. If the w_bits < 16 and this flag is not set, we use GPTQ')
-    parser.add_argument('--w_clip', action=argparse.BooleanOptionalAction, default=False,
+    parser.add_argument('--w_clip', action=argparse.BooleanOptionalAction, default=True,
                         help='''Clipping the weight quantization! 
                         We do not support arguments for clipping and we find the best clip ratio during the weight quantization''')
     parser.add_argument('--nsamples', type=int, default=128,
@@ -260,7 +260,7 @@ def setup_args():
     parser.add_argument('--int8_down_proj', action=argparse.BooleanOptionalAction, default=False,
                         help='Use INT8 for Down Projection! If this set, both weights and activations of this layer will be in INT8')
     # KV-Cache Quantization Arguments
-    parser.add_argument('--v_bits', type=int, default=4,
+    parser.add_argument('--v_bits', type=int, default=16,
                         help='''Number of bits for V-cache quantization. 
                         Note that quantizing the V-cache does not need any other rotation''')
     parser.add_argument('--v_groupsize', type=int, default=-1)
@@ -269,7 +269,7 @@ def setup_args():
     parser.add_argument('--v_clip_ratio', type=float, default=1.0,
         help='Clip ratio for v-cache quantization. new_max = max * clip_ratio')
     
-    parser.add_argument('--k_bits', type=int, default=4,
+    parser.add_argument('--k_bits', type=int, default=16,
                         help='''Number of bits for K-cache quantization. 
                         Note that quantizing the K-cache needs another rotation for the keys/queries''')
     parser.add_argument('--k_groupsize', type=int, default=-1)
@@ -474,6 +474,12 @@ def main():
                 qlayers[name].K = K
                 qlayers[name].had_dim = head_dim
                 qlayers[name].fp32_had = args.fp32_had
+    else:
+        allow_names = quant_utils.build_aggregator_linear_allowlist(model)
+        quant_utils.add_actquant(model,allow_names=allow_names)
+        qlayers = quant_utils.find_qlayers(model,allow_names)
+        hidden_size, num_heads, intermediate_size = model_utils.get_model_sizes(model)
+        head_dim = hidden_size // num_heads
     
     
     if args.w_bits < 16:

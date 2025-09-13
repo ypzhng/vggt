@@ -1,4 +1,5 @@
 import torch, math
+import ipdb
 import fast_hadamard_transform
 # Adapted from https://github.com/Cornell-RelaxML/quip-sharp/blob/main/lib/utils/matmul_had.py
 
@@ -105,41 +106,114 @@ def matmul_hadUt_cuda(X, hadK, K):
     return matmul_hadU_cuda(X, hadK, K, transpose=True)
 
 
-def apply_exact_had_to_linear(module, had_dim=-1, output=False):
+# def apply_exact_had_to_linear(module, had_dim=-1, output=False):
+#     assert isinstance(module, torch.nn.Linear)
+#     in_features, out_features = module.in_features, module.out_features
+    
+#     if had_dim != -1:
+#         assert is_pow2(had_dim), "Hadamard dimension must be a power of 2!"
+    
+#     W_ = module.weight.data
+#     dtype = W_.dtype
+#     dev = W_.device
+#     init_shape = W_.shape
+#     W_ = W_.float().cuda()
+    
+#     if had_dim == -1:
+#         if output:
+#             had_K, K = get_hadK(out_features)
+#             W_ = matmul_hadU_cuda(W_.t(), had_K, K).t()
+#         if not output:
+#             had_K, K = get_hadK(in_features)
+#             W_ = matmul_hadU_cuda(W_, had_K, K)
+#     else:
+#         # Apply Hadamard to the last had_dim chunks of the weights
+#         # ipdb.set_trace()
+#         if output:
+#             W_ = W_.t()
+#             transposed_shape = W_.shape
+#             W_ = fast_hadamard_transform.hadamard_transform(
+#                 W_.reshape(-1, transposed_shape[-1]//had_dim, had_dim), 
+#                 scale=1/math.sqrt(had_dim)
+#                 ).reshape(transposed_shape).t()
+#         else:
+#             raise NotImplementedError("Not implemented (or tested) yet!")
+#             n = W_.shape[1]
+#             W_ = hadamard_transform(W_.reshape(-1, n//had_dim, had_dim), scale=1/math.sqrt(had_dim)).reshape(init_shape)
+#     module.weight.data = W_.to(device=dev, dtype=dtype)
+
+def apply_exact_had_to_linear(module, had_dim: int = -1, output: bool = False):
     assert isinstance(module, torch.nn.Linear)
     in_features, out_features = module.in_features, module.out_features
-    
+
     if had_dim != -1:
         assert is_pow2(had_dim), "Hadamard dimension must be a power of 2!"
-    
+
     W_ = module.weight.data
     dtype = W_.dtype
     dev = W_.device
     init_shape = W_.shape
-    W_ = W_.float().cuda()
-    
+
+    # Work in FP32 on the same device (kernels expect float32)
+    W_ = W_.to(device=dev, dtype=torch.float32)
+    b_ = None
+    if module.bias is not None:
+        b_ = module.bias.data.to(device=dev, dtype=torch.float32)
+
     if had_dim == -1:
         if output:
             had_K, K = get_hadK(out_features)
+            # Ensure helper tensors are FP32 on the same device if they are tensors
+            if isinstance(had_K, torch.Tensor):
+                had_K = had_K.to(device=dev, dtype=torch.float32)
+            if isinstance(K, torch.Tensor):
+                K = K.to(device=dev, dtype=torch.float32)
+
+            # Left-multiply rows (operate on transposed, then transpose back)
             W_ = matmul_hadU_cuda(W_.t(), had_K, K).t()
-        if not output:
+
+            # Bias must be rotated the same way when output=True
+            if b_ is not None:
+                # Treat bias as a (1, out_features) row and apply the same transform over the last dim
+                b_ = matmul_hadU_cuda(b_.unsqueeze(0), had_K, K).squeeze(0)
+        else:
             had_K, K = get_hadK(in_features)
+            if isinstance(had_K, torch.Tensor):
+                had_K = had_K.to(device=dev, dtype=torch.float32)
+            if isinstance(K, torch.Tensor):
+                K = K.to(device=dev, dtype=torch.float32)
             W_ = matmul_hadU_cuda(W_, had_K, K)
+            # Bias unchanged when rotating input axis
     else:
         # Apply Hadamard to the last had_dim chunks of the weights
         if output:
-            W_ = W_.t()
-            transposed_shape = W_.shape
-            W_ = fast_hadamard_transform.hadamard_transform(
-                W_.reshape(-1, transposed_shape[-1]//had_dim, had_dim), 
-                scale=1/math.sqrt(had_dim)
-                ).reshape(transposed_shape).t()
+            # Rotate along output features (rows): transpose, chunk-transform on last dim, transpose back
+            W_t = W_.t()
+            transposed_shape = W_t.shape  # (in_features, out_features)
+            W_t = fast_hadamard_transform.hadamard_transform(
+                W_t.reshape(-1, transposed_shape[-1] // had_dim, had_dim),
+                scale=1 / math.sqrt(had_dim)
+            ).reshape(transposed_shape)
+            W_ = W_t.t()
+
+            # Apply the same chunked transform to the bias across out_features
+            if b_ is not None:
+                # Shape (out_features,) -> (1, out_features) to reuse same kernel
+                b_row = b_.unsqueeze(0)
+                b_row = fast_hadamard_transform.hadamard_transform(
+                    b_row.reshape(-1, b_row.shape[-1] // had_dim, had_dim),
+                    scale=1 / math.sqrt(had_dim)
+                ).reshape(1, -1)
+                b_ = b_row.squeeze(0)
         else:
             raise NotImplementedError("Not implemented (or tested) yet!")
-            n = W_.shape[1]
-            W_ = hadamard_transform(W_.reshape(-1, n//had_dim, had_dim), scale=1/math.sqrt(had_dim)).reshape(init_shape)
-    module.weight.data = W_.to(device=dev, dtype=dtype)
+            # n = W_.shape[1]
+            # W_ = hadamard_transform(W_.reshape(-1, n//had_dim, had_dim), scale=1/math.sqrt(had_dim)).reshape(init_shape)
 
+    # Write back in original dtype/device
+    module.weight.data = W_.to(device=dev, dtype=dtype)
+    if b_ is not None:
+        module.bias.data = b_.to(device=dev, dtype=module.bias.data.dtype)
 
 
 def is_pow2(n):
